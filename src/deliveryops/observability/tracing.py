@@ -1,7 +1,9 @@
-"""OpenTelemetry tracing setup with automatic structlog trace_id correlation."""
+"""OpenTelemetry tracing setup with structlog correlation and JSON trace export."""
 
+import json
 from collections.abc import Iterator
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any
 
 from opentelemetry import trace
@@ -70,3 +72,39 @@ def traced_span(span_name: str, **attributes: Any) -> Iterator[trace.Span]:
                 span_id=f"{ctx.span_id:016x}",
             )
         yield span
+
+
+def serialize_recorded_spans() -> list[dict[str, Any]]:
+    """Return all recorded spans from the active in-memory exporter as dictionaries."""
+    if _ACTIVE_EXPORTER is None:
+        return []
+    records: list[dict[str, Any]] = []
+    for span in _ACTIVE_EXPORTER.get_finished_spans():
+        ctx = span.get_span_context()
+        duration_ms = (
+            round((span.end_time - span.start_time) / 1_000_000.0, 2)
+            if span.end_time is not None and span.start_time is not None
+            else 0.0
+        )
+        records.append(
+            {
+                "name": span.name,
+                "trace_id": f"{ctx.trace_id:032x}" if ctx else "",
+                "span_id": f"{ctx.span_id:016x}" if ctx else "",
+                "duration_ms": duration_ms,
+                "attributes": dict(span.attributes) if span.attributes else {},
+            }
+        )
+    return records
+
+
+def export_spans_to_file(output_path: Path | str) -> Path:
+    """Persist recorded OpenTelemetry spans as an OTLP-style JSON trace bundle."""
+    target = Path(output_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "span_count": len(serialize_recorded_spans()),
+        "spans": serialize_recorded_spans(),
+    }
+    target.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    return target

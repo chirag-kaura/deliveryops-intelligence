@@ -1,0 +1,20 @@
+{
+  "endpoint": "http://localhost:9000",
+  "buckets": [
+    {
+      "name": "deliveryops-bronze",
+      "layer": "bronze",
+      "formats": ["jsonl"]
+    },
+    {
+      "name": "deliveryops-silver",
+      "layer": "silver",
+      "formats": ["parquet"]
+    },
+    {
+      "name": "deliveryops-gold",
+      "layer": "gold",
+      "formats": ["parquet"]
+    }
+  ]
+}

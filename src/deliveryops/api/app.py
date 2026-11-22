@@ -9,7 +9,12 @@ from pydantic import BaseModel, ConfigDict, Field
 
 import deliveryops
 from deliveryops.config import AppSettings, get_settings
-from deliveryops.observability import traced_span
+from deliveryops.observability import (
+    InfrastructureHealthReport,
+    check_infrastructure_health,
+    serialize_recorded_spans,
+    traced_span,
+)
 from deliveryops.pipelines import (
     AssetGraphOrchestrator,
     MedallionPipelineRunner,
@@ -60,6 +65,18 @@ def create_app(
             "version": deliveryops.__version__,
             "storage_backend": cfg.storage_backend,
         }
+
+    @api.get("/infra/status", response_model=InfrastructureHealthReport)
+    def get_infra_status() -> InfrastructureHealthReport:
+        with traced_span("api.get_infra_status"):
+            return check_infrastructure_health(settings=cfg)
+
+    @api.get("/observability/traces")
+    def get_recorded_traces(
+        limit: int = Query(default=100, ge=1, le=500),
+    ) -> dict[str, Any]:
+        spans = serialize_recorded_spans()
+        return {"count": len(spans), "spans": spans[-limit:]}
 
     @api.post("/pipeline/run", response_model=PipelineRunMetrics)
     def trigger_pipeline_run(request: PipelineRunRequest) -> PipelineRunMetrics:

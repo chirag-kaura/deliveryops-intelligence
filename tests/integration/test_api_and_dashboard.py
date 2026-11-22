@@ -20,7 +20,7 @@ def test_fastapi_endpoints_and_dashboard_snapshot(tmp_path: Path) -> None:
     health_resp = client.get("/health")
     assert health_resp.status_code == 200
     assert health_resp.json()["status"] == "healthy"
-    assert health_resp.json()["version"] == "0.5.0"
+    assert health_resp.json()["version"] == "0.6.0"
 
     # 2. Trigger Medallion pipeline batch via API
     run_resp = client.post(
