@@ -4,11 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "deliveryops-intelligence"
-version = "0.1.0"
+version = "0.2.0"
 description = "Local-first, production-inspired DeliveryOps data engineering platform"
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
-dependencies = []
+dependencies = [
+    "pydantic>=2.7.0",
+    "pydantic-settings>=2.2.0",
+    "structlog>=24.1.0",
+]
 
 [project.optional-dependencies]
 dev = [
