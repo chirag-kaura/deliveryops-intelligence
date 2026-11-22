@@ -1,0 +1,29 @@
+version: 2
+
+sources:
+  - name: silver
+    description: "Validated and deduplicated Silver delivery lifecycle events"
+    tables:
+      - name: events
+        description: "Silver Parquet delivery events"
+
+models:
+  - name: stg_silver_events
+    description: "Staging view normalizing Silver delivery events for downstream Gold marts"
+    columns:
+      - name: event_id
+        tests: [not_null, unique]
+      - name: order_id
+        tests: [not_null]
+  - name: mart_zone_kpi_daily
+    description: "Daily Gold KPI aggregations per operational delivery zone"
+    columns:
+      - name: zone_id
+        tests: [not_null]
+      - name: partition_date
+        tests: [not_null]
+  - name: mart_courier_performance
+    description: "Daily Gold courier SLA and throughput metrics"
+    columns:
+      - name: courier_id
+        tests: [not_null]

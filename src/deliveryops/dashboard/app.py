@@ -6,15 +6,16 @@ from typing import Any
 import polars as pl
 
 from deliveryops.config import get_settings
-from deliveryops.pipelines import MedallionPipelineRunner
-from deliveryops.storage import LocalLakeStorage
+from deliveryops.pipelines import AssetGraphOrchestrator
+from deliveryops.storage import GoldWarehouseLoader, LocalLakeStorage
 
 
 def load_dashboard_snapshot(lake_dir: Path | str | None = None) -> dict[str, Any]:
-    """Load Bronze DLQ, Silver events, and Gold KPI summaries from the local lake."""
+    """Load Bronze DLQ, Silver events, Gold KPIs, Warehouse summary, and Asset DAG lineage."""
     settings = get_settings()
     target_dir = Path(lake_dir) if lake_dir is not None else settings.local_lake_dir
     lake = LocalLakeStorage(base_dir=target_dir)
+    warehouse = GoldWarehouseLoader(lake=lake)
 
     zone_files = lake.list_parquet_files("gold", "zone_kpi_daily")
     courier_files = lake.list_parquet_files("gold", "courier_performance")
@@ -45,6 +46,8 @@ def load_dashboard_snapshot(lake_dir: Path | str | None = None) -> dict[str, Any
         "zone_kpis": zone_df.to_dicts() if not zone_df.is_empty() else [],
         "courier_performance": courier_df.to_dicts() if not courier_df.is_empty() else [],
         "dlq_records": dlq_records,
+        "asset_lineage": AssetGraphOrchestrator.get_asset_lineage(),
+        "warehouse_summary": warehouse.query_summary(),
     }
 
 
@@ -53,26 +56,28 @@ def render_dashboard() -> None:
     import streamlit as st
 
     st.set_page_config(page_title="DeliveryOps Intelligence", layout="wide")
-    st.title("DeliveryOps Intelligence — Medallion Control Plane")
+    st.title("DeliveryOps Intelligence — Medallion & Asset Control Plane")
 
     settings = get_settings()
     with st.sidebar:
-        st.header("Pipeline Controls")
+        st.header("Asset Orchestration Controls")
         batch_size = int(st.number_input("Batch Size", min_value=10, max_value=1000, value=60))
         corrupt_ratio = float(
             st.slider("Fault Injection (DLQ Ratio)", min_value=0.0, max_value=0.5, value=0.10)
         )
         seed = int(st.number_input("Random Seed", min_value=1, max_value=99999, value=42))
-        if st.button("Run Medallion Pipeline Batch"):
-            runner = MedallionPipelineRunner(lake_dir=settings.local_lake_dir, settings=settings)
-            metrics = runner.run_batch(
+        if st.button("Materialize Full Asset Graph"):
+            orchestrator = AssetGraphOrchestrator(
+                lake_dir=settings.local_lake_dir,
+                settings=settings,
+            )
+            result = orchestrator.materialize_all(
                 batch_size=batch_size,
                 corrupt_ratio=corrupt_ratio,
                 seed=seed,
             )
             st.success(
-                f"Run {metrics.run_id} complete: {metrics.silver_row_count} Silver rows, "
-                f"{metrics.bronze_dlq_count} DLQ records."
+                f"DAG Run {result.run_id} succeeded ({len(result.materializations)} assets)"
             )
 
     snapshot = load_dashboard_snapshot(settings.local_lake_dir)
@@ -83,10 +88,13 @@ def render_dashboard() -> None:
     col3.metric("SLA Breaches", snapshot["sla_breach_count"])
     col4.metric("SLA Breach Rate %", f"{snapshot['sla_breach_rate_pct']}%")
 
-    st.subheader("Gold Layer — Zone Daily KPIs")
+    st.subheader("Software-Defined Asset Lineage DAG")
+    st.dataframe(snapshot["asset_lineage"], use_container_width=True)
+
+    st.subheader("Gold Layer (dbt Mart) — Zone Daily KPIs")
     st.dataframe(snapshot["zone_kpis"], use_container_width=True)
 
-    st.subheader("Gold Layer — Courier Performance")
+    st.subheader("Gold Layer (dbt Mart) — Courier Performance")
     st.dataframe(snapshot["courier_performance"], use_container_width=True)
 
     st.subheader("Bronze DLQ — Contract Violation Triage")

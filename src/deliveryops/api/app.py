@@ -10,8 +10,13 @@ from pydantic import BaseModel, ConfigDict, Field
 import deliveryops
 from deliveryops.config import AppSettings, get_settings
 from deliveryops.observability import traced_span
-from deliveryops.pipelines import MedallionPipelineRunner, PipelineRunMetrics
-from deliveryops.storage import LocalLakeStorage
+from deliveryops.pipelines import (
+    AssetGraphOrchestrator,
+    MedallionPipelineRunner,
+    OrchestrationRunResult,
+    PipelineRunMetrics,
+)
+from deliveryops.storage import GoldWarehouseLoader, LocalLakeStorage
 
 
 class PipelineRunRequest(BaseModel):
@@ -66,6 +71,33 @@ def create_app(
                 seed=request.seed,
                 batch_id=request.batch_id,
             )
+
+    @api.get("/orchestration/assets")
+    def get_asset_graph() -> dict[str, Any]:
+        with traced_span("api.get_asset_graph"):
+            assets = AssetGraphOrchestrator.get_asset_lineage()
+            return {"count": len(assets), "assets": assets}
+
+    @api.post("/orchestration/materialize", response_model=OrchestrationRunResult)
+    def materialize_asset_graph(request: PipelineRunRequest) -> OrchestrationRunResult:
+        with traced_span("api.materialize_asset_graph", batch_id=request.batch_id):
+            orchestrator = AssetGraphOrchestrator(lake_dir=target_lake_dir, settings=cfg)
+            return orchestrator.materialize_all(
+                batch_size=request.batch_size,
+                corrupt_ratio=request.corrupt_ratio,
+                seed=request.seed,
+                batch_id=request.batch_id,
+            )
+
+    @api.get("/warehouse/summary")
+    def get_warehouse_summary() -> dict[str, Any]:
+        with traced_span("api.get_warehouse_summary"):
+            warehouse = GoldWarehouseLoader(
+                lake=lake,
+                memory_limit=cfg.duckdb_memory_limit,
+                threads=cfg.duckdb_threads,
+            )
+            return warehouse.query_summary()
 
     @api.get("/analytics/zones")
     def get_zone_kpis(
