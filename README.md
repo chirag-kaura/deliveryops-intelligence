@@ -4,61 +4,67 @@ A local-first, production-inspired data engineering platform built for constrain
 
 ## Architecture Overview
 
-DeliveryOps Intelligence separates **stateful infrastructure backing services** (run in Docker with strict memory caps and Compose profiles) from **Python data workloads** (run natively on the host in a Python 3.11.9 `.venv`).
+DeliveryOps Intelligence implements a full **5-Asset Medallion Architecture** with streaming ingestion, contract validation, Dead-Letter Queue (DLQ) routing, SQL dbt transformations, DuckDB analytics, OpenTelemetry distributed tracing, FastAPI serving, and a Streamlit control plane.
 
-- **Streaming**: Redpanda (Kafka-compatible, single-node dev container)
-- **Object Storage**: MinIO (S3-compatible) with local filesystem fallback
-- **Operational & Serving Warehouse**: PostgreSQL 16 Alpine
-- **Analytical Processing**: DuckDB + Polars + PyArrow
-- **SQL Modeling**: dbt Core
-- **Data Contracts & Quality**: Pydantic v2 + Pandera
-- **Orchestration**: Lightweight custom Python runner initially (Dagster in the orchestration phase)
-- **Observability**: OpenTelemetry + `structlog` + Jaeger
-- **Serving & UI**: FastAPI + Streamlit
-- **Testing & Linting**: Pytest + Ruff
+- **Streaming**: Redpanda-compatible broker (`InMemoryEventBroker` + `StreamIngestionConsumer`) with topic offsets & consumer lag
+- **Data Contracts**: Pydantic v2 ingestion gate (`DeliveryEvent`, `DeadLetterRecord`) + Pandera tabular checks (`SILVER_EVENTS_SCHEMA`)
+- **Storage & Lakehouse**: Hive-partitioned local Medallion lake (`bronze/`, `silver/`, `gold/`) + S3/MinIO URI mapper (`S3LakeAdapter`) + DuckDB/PostgreSQL warehouse (`GoldWarehouseLoader`)
+- **Analytical & SQL Layer**: Polars + PyArrow + resource-capped DuckDB (`memory_limit=1GB`, `threads=2`) + dbt SQL models (`dbt/`)
+- **Orchestration**: 5-asset declarative DAG (`AssetGraphOrchestrator`: `stream_raw_topic` -> `bronze_events_and_dlq` -> `silver_validated_events` -> `gold_dbt_marts` -> `warehouse_serving_tables`)
+- **Observability**: OpenTelemetry trace spans (`traced_span`, JSON trace bundle export) + `structlog` trace-correlated JSON logging + TCP infra probes (`/infra/status`)
+- **Serving & UI**: FastAPI REST API + Streamlit Control Plane Dashboard
 
-## Hardware & Resource Baseline
+## One-Click Launch & Shutdown (Windows)
 
-- **Host CPU**: 4 physical cores / 8 logical threads (`Intel Core i5-1135G7`)
-- **Docker / WSL2 Limit**: `3 GB` configured in `.wslconfig` (`2.84 GiB` usable in Docker)
-- **Combined Core Container Memory Cap**: `1,408 MB` (`postgres` 256 MB, `redpanda` 640 MB, `minio` 256 MB, `jaeger` 256 MB)
+### Start Platform (`start.bat`)
+```bat
+start.bat
+```
+This runs in **Hybrid Local-First Mode** (0 MB extra Docker RAM):
+1. Creates `.env` from `.env.example` if missing.
+2. Materializes the 5-asset Medallion DAG via `scripts\run_platform.py`.
+3. Starts **FastAPI** on `http://127.0.0.1:8001` (`logs\fastapi.log`).
+4. Starts **Streamlit** on `http://127.0.0.1:8501` (`logs\streamlit.log`).
+
+To also start the Docker Compose `core` profile (`postgres:16-alpine`):
+```bat
+start.bat --with-docker
+```
+
+### Stop Platform (`stop.bat`)
+```bat
+stop.bat
+```
+Stops the background FastAPI (`8001`) and Streamlit (`8501`) processes and pauses any active DeliveryOps Docker Compose services.
+
+## Key API Endpoints (FastAPI)
+
+- `GET /health` — Service health & version (`0.6.0`)
+- `GET /infra/status` — Live TCP reachability & fallback report (`postgres`, `redpanda`, `minio`, `jaeger_otlp`)
+- `GET /observability/traces` — Recorded OpenTelemetry spans
+- `GET /orchestration/assets` — 5-asset DAG lineage graph
+- `POST /orchestration/materialize` — Execute the full 5-asset pipeline DAG
+- `GET /warehouse/summary` — Relational serving warehouse table counts & top zones
+- `GET /analytics/zones` / `GET /analytics/couriers` / `GET /analytics/dlq` — Gold marts & DLQ records
 
 ## Repository Layout
 
 ```text
 deliveryops-intelligence/
+├── start.bat             # One-click platform launcher (CLI + FastAPI + Streamlit)
+├── stop.bat              # Clean shutdown script for local processes & Compose services
 ├── src/deliveryops/      # Core platform Python package
-│   ├── config/           # Configuration loading and validation
-│   ├── contracts/        # Pydantic v2 & Pandera data contracts
-│   ├── ingestion/        # Event producers & stream consumers
-│   ├── storage/          # S3/MinIO & local lake storage adapters
-│   ├── processing/       # DuckDB & Polars Bronze/Silver/Gold processors
-│   ├── pipelines/        # Pipeline runner & orchestration hooks
-│   ├── observability/    # OpenTelemetry tracing & structlog setup
-│   ├── api/              # FastAPI serving layer
-│   └── dashboard/        # Streamlit intelligence UI
-├── tests/                # Unit and integration tests
-├── infra/                # Infrastructure initialization & config assets
-├── dbt/                  # dbt Core SQL models & tests
-├── scripts/              # Developer utility scripts
-├── docs/                 # Architecture & operational documentation
+├── dbt/                  # dbt Core SQL models (staging view + Gold marts) & schema tests
+├── infra/                # Postgres DDL, Redpanda topic config, MinIO bucket manifest
+├── scripts/              # CLI platform entrypoint (run_platform.py)
+├── tests/                # Unit and integration test suite
 ├── docker-compose.yml    # Resource-capped infrastructure profiles
-├── pyproject.toml        # Package metadata, Ruff & Pytest configuration
-└── .env.example          # Environment configuration template
+└── pyproject.toml        # Dependencies, Ruff & Pytest configuration
 ```
 
-## Quickstart (Phase 1 Baseline)
+## Development & Verification
 
-1. Activate the Python 3.11.9 virtual environment:
-   ```powershell
-   .\.venv\Scripts\Activate.ps1
-   ```
-2. Verify code formatting and smoke tests:
-   ```powershell
-   ruff check .
-   pytest -v
-   ```
-3. Validate Docker Compose profiles (requires Docker Engine running to start services):
-   ```powershell
-   docker compose --profile core config
-   ```
+```powershell
+.\.venv\Scripts\python.exe -m ruff check .
+.\.venv\Scripts\python.exe -m pytest -v
+```
