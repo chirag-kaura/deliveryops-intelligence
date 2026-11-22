@@ -40,7 +40,7 @@ class SilverToGoldProcessor:
         try:
             conn.read_parquet(silver_files).create_view("silver_events")
 
-            zone_kpi_arrow = conn.execute(
+            zone_kpi_arrow = conn.sql(
                 """
                 SELECT
                     zone_id,
@@ -72,7 +72,7 @@ class SilverToGoldProcessor:
                 """
             ).to_arrow_table()
 
-            courier_perf_arrow = conn.execute(
+            courier_perf_arrow = conn.sql(
                 """
                 SELECT
                     courier_id,

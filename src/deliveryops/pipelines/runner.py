@@ -9,7 +9,7 @@ from pydantic import BaseModel, ConfigDict
 from deliveryops.config import AppSettings, get_settings
 from deliveryops.contracts import validate_event_batch
 from deliveryops.ingestion import DeliveryEventGenerator
-from deliveryops.observability import bind_context, clear_context, get_logger
+from deliveryops.observability import bind_context, clear_context, get_logger, traced_span
 from deliveryops.processing import BronzeToSilverProcessor, SilverToGoldProcessor
 from deliveryops.storage import LocalLakeStorage
 
@@ -60,42 +60,48 @@ class MedallionPipelineRunner:
         run_id = f"run-{uuid4().hex[:8]}"
         bind_context(pipeline_run_id=run_id, batch_id=batch_id)
         try:
-            effective_time = base_time or datetime(2026, 11, 22, 12, 0, tzinfo=UTC)
-            partition_date = effective_time.astimezone(UTC).strftime("%Y-%m-%d")
-
-            generator = DeliveryEventGenerator(seed=seed)
-            raw_batch = generator.generate_batch(
-                batch_size=batch_size,
-                corrupt_ratio=corrupt_ratio,
-                base_time=effective_time,
-            )
-
-            validation = validate_event_batch(raw_batch)
-            self.lake.write_bronze_events(
-                validation.valid_events,
-                batch_id=batch_id,
-                partition_date=partition_date,
-            )
-            self.lake.write_dlq_records(
-                validation.dead_letter_records,
-                batch_id=batch_id,
-                partition_date=partition_date,
-            )
-
-            silver_df, _ = self.silver_processor.process_all(batch_id=batch_id)
-            zone_df, courier_df, _ = self.gold_processor.build_gold_tables(batch_id=batch_id)
-
-            metrics = PipelineRunMetrics(
+            with traced_span(
+                "medallion.run_batch",
                 run_id=run_id,
                 batch_id=batch_id,
-                total_generated=len(raw_batch),
-                bronze_valid_count=len(validation.valid_events),
-                bronze_dlq_count=len(validation.dead_letter_records),
-                silver_row_count=silver_df.height,
-                gold_zone_rows=zone_df.height,
-                gold_courier_rows=courier_df.height,
-            )
-            self.logger.info("medallion_pipeline_completed", **metrics.model_dump())
-            return metrics
+                batch_size=batch_size,
+            ):
+                effective_time = base_time or datetime(2026, 11, 22, 12, 0, tzinfo=UTC)
+                partition_date = effective_time.astimezone(UTC).strftime("%Y-%m-%d")
+
+                generator = DeliveryEventGenerator(seed=seed)
+                raw_batch = generator.generate_batch(
+                    batch_size=batch_size,
+                    corrupt_ratio=corrupt_ratio,
+                    base_time=effective_time,
+                )
+
+                validation = validate_event_batch(raw_batch)
+                self.lake.write_bronze_events(
+                    validation.valid_events,
+                    batch_id=batch_id,
+                    partition_date=partition_date,
+                )
+                self.lake.write_dlq_records(
+                    validation.dead_letter_records,
+                    batch_id=batch_id,
+                    partition_date=partition_date,
+                )
+
+                silver_df, _ = self.silver_processor.process_all(batch_id=batch_id)
+                zone_df, courier_df, _ = self.gold_processor.build_gold_tables(batch_id=batch_id)
+
+                metrics = PipelineRunMetrics(
+                    run_id=run_id,
+                    batch_id=batch_id,
+                    total_generated=len(raw_batch),
+                    bronze_valid_count=len(validation.valid_events),
+                    bronze_dlq_count=len(validation.dead_letter_records),
+                    silver_row_count=silver_df.height,
+                    gold_zone_rows=zone_df.height,
+                    gold_courier_rows=courier_df.height,
+                )
+                self.logger.info("medallion_pipeline_completed", **metrics.model_dump())
+                return metrics
         finally:
             clear_context()
