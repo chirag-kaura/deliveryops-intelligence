@@ -1,0 +1,55 @@
+# Virtual Environments
+.venv/
+venv/
+ENV/
+
+# Python Bytecode & Packaging
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Environment & Secrets
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# Local Data Lake, Databases & Storage
+data/
+*.duckdb
+*.duckdb.wal
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs
+logs/
+*.log
+
+# dbt Artifacts
+dbt/target/
+dbt/dbt_packages/
+dbt/logs/
+
+# Orchestration State
+.dagster/
+dagster_home/
+
+# Testing & Tooling Caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# OS & Editor Files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
