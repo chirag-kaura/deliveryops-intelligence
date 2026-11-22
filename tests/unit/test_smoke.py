@@ -6,7 +6,7 @@ import deliveryops
 
 
 def test_package_version() -> None:
-    assert deliveryops.__version__ == "0.2.0"
+    assert deliveryops.__version__ == "0.3.0"
 
 
 def test_python_version_is_311() -> None:

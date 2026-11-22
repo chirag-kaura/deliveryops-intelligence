@@ -6,11 +6,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import polars as pl
+
 from deliveryops.contracts.events import DeadLetterRecord, DeliveryEvent
 
 
 class LocalLakeStorage:
-    """Manages partitioned JSONL storage for Bronze valid events and Dead-Letter records."""
+    """Manages partitioned JSONL and Parquet storage across Bronze, Silver, and Gold layers."""
 
     def __init__(self, base_dir: Path | str) -> None:
         self.base_dir = Path(base_dir)
@@ -63,3 +65,24 @@ class LocalLakeStorage:
                 if line.strip():
                     records.append(json.loads(line))
         return records
+
+    def write_parquet_dataset(
+        self,
+        df: pl.DataFrame,
+        layer: str,
+        dataset: str,
+        partition_date: str,
+        filename: str = "part-0000.parquet",
+    ) -> Path:
+        """Write a Polars DataFrame to a Hive date-partitioned Parquet file."""
+        part_dir = self._partition_dir(layer, dataset, partition_date)
+        file_path = part_dir / filename
+        df.write_parquet(file_path)
+        return file_path
+
+    def list_parquet_files(self, layer: str, dataset: str) -> list[Path]:
+        """Return all Parquet files under a layer/dataset directory."""
+        dataset_root = self.base_dir / layer / dataset
+        if not dataset_root.exists():
+            return []
+        return sorted(dataset_root.rglob("*.parquet"))
