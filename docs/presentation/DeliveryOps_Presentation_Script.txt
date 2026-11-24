@@ -1,0 +1,694 @@
+================================================================================
+ DELIVERYOPS INTELLIGENCE
+ Presentation Script + Technical Appendix
+================================================================================
+
+How to use this file
+--------------------
+ PART A  Speaker script, one section per slide (about 6-8 minutes spoken).
+         Say the lines in quotes; the [DO] lines are actions.
+ PART B  Technical appendix: every tool, the file it lives in, how it processes
+         data, and why it was chosen over the alternative.
+ PART C  Step-by-step trace of "Place Order" and "Simulate Corrupt Order".
+ PART D  Faculty Q&A preparation, including honest limitations.
+
+Every number in this file comes from a real run of the code on 2026-11-23:
+  AssetGraphOrchestrator().materialize_all()   (batch_size=50, corrupt_ratio=0.10, seed=42)
+  submit_live_ecommerce_order(...)             (one valid order, one corrupt order)
+Test suite: 23 passed.   Ruff lint: "All checks passed!"
+
+
+================================================================================
+ PART A - SPEAKER SCRIPT
+================================================================================
+
+--------------------------------------------------------------------------------
+SLIDE 1 - Title                                                     (~20 sec)
+--------------------------------------------------------------------------------
+"Good morning. Our project is DeliveryOps Intelligence: a local-first,
+production-style streaming data platform for a food-delivery business.
+
+In one sentence: a customer clicks 'Place Order', and within a fraction of a
+second that click has become validated events, cleaned tables and business KPIs
+such as SLA breach rate per zone and courier performance. Bad records are
+caught and kept aside with the reason they failed. All of this runs on one
+laptop."
+
+--------------------------------------------------------------------------------
+SLIDE 2 - The problem                                               (~40 sec)
+--------------------------------------------------------------------------------
+"Three pressures shaped every design decision.
+
+First, events never stop. A single order is not one row. It is a lifecycle:
+ORDER_CREATED, COURIER_ASSIGNED, PICKUP_COMPLETED and DELIVERY_COMPLETED,
+plus failures and SLA breaches. That is seven event types in our contract.
+
+Second, bad data is silent. One negative order value or a pickup with no
+courier will not crash anything. It quietly corrupts the average order value
+and the SLA numbers that managers use.
+
+Third, we have a laptop, not a cluster. Docker on WSL2 has a 3 GB memory
+budget, so every component had to be chosen for a small footprint.
+
+So the goal: turn raw order events into trusted KPIs in near real time, and
+quarantine bad records instead of losing them."
+
+--------------------------------------------------------------------------------
+SLIDE 3 - End-to-end architecture                                   (~70 sec)
+--------------------------------------------------------------------------------
+"Let me walk left to right.
+
+Event sources: the Streamlit storefront, where a user places an order, and a
+synthetic generator that produces realistic batches for four Bangalore zones,
+including deliberately corrupted records.
+
+Events are published to an event broker with Kafka semantics: topics,
+offsets, consumer groups and consumer lag. We use Redpanda, which speaks the
+Kafka API.
+
+A consumer reads from the topic and passes each message through the contract
+gate, built with Pydantic. Valid events continue. Invalid events go down to
+the dead-letter queue, together with the exact reason they failed.
+
+Valid events then flow through the medallion lake:
+  - Bronze stores the raw validated events as JSONL.
+  - Silver uses Polars to flatten, deduplicate and add SLA columns, and
+    Pandera validates the whole DataFrame. It is stored as Parquet.
+  - Gold runs our dbt SQL models on DuckDB to build the KPI marts.
+Every layer is partitioned by date: dt=YYYY-MM-DD.
+
+Finally, the Serving layer loads Gold and the DLQ audit into a warehouse,
+DuckDB locally and mirrored into PostgreSQL. FastAPI and Streamlit read from it.
+
+Underneath: a five-asset DAG orchestrates the stages, OpenTelemetry traces
+every stage into Jaeger, and MinIO and LocalStack hold S3 copies of each layer."
+
+--------------------------------------------------------------------------------
+SLIDE 4 - One batch through the medallion layers                    (~60 sec)
+--------------------------------------------------------------------------------
+"These are real numbers from one run of the pipeline.
+
+We generate 50 events with 10 percent fault injection and a fixed seed of 42,
+so the run is reproducible. Publishing them to the topic takes 1.3 ms.
+
+The contract gate passes 45 and rejects 5 to the dead-letter queue. Those 5
+were corrupted on purpose: a bad order ID, a pickup without a courier, a
+latitude of 145, or a negative price.
+
+Silver holds 45 rows. Here Polars computes the SLA variance: the actual
+duration (or the ETA if the order is not finished) minus the 35-minute target,
+plus a boolean is_sla_breached.
+
+Gold produces 42 rows: 4 zone-day KPI rows, one per zone, and 38 courier
+performance rows.
+
+The warehouse holds 47 rows across three tables: the 4 zone rows, the 38
+courier rows and 5 DLQ audit rows.
+
+All three dbt tests passed, and the whole run took about 283 ms end to end."
+
+--------------------------------------------------------------------------------
+SLIDE 5 - Live demo: one click, two paths                           (~90 sec)
+--------------------------------------------------------------------------------
+[DO] Open Streamlit at http://127.0.0.1:8501. Add an item, pick zone
+     BLR-KOR-01, set delivery time to 42 minutes, click "Place Order".
+
+"When I click Place Order, the app creates four lifecycle events for this one
+order, from ORDER_CREATED to DELIVERY_COMPLETED. All four pass the contract.
+Because the delivery took 42 minutes against a 35-minute target, Silver flags
+the order as an SLA breach. Gold recomputes the zone and courier KPIs, and the
+results are pushed to the containers."
+
+[DO] Show Adminer (8082) -> wh_zone_kpi_daily; Redpanda Console (8081) ->
+     deliveryops.events.raw; MinIO (9001) -> deliveryops-silver bucket;
+     Jaeger (16686) -> service deliveryops-intelligence.
+
+[DO] Click "Simulate Corrupt Order".
+
+"Now the corrupt path. This sends one event with order_value_inr = -500 and no
+courier on a pickup. Pydantic rejects it with the message 'Input should be
+greater than 0'. Nothing reaches Bronze. The record lands in the dead-letter
+queue, a new row appears in wh_dlq_audit, and the message also appears on the
+deliveryops.events.dlq topic."
+
+[DO] Refresh Adminer -> wh_dlq_audit; Redpanda Console -> deliveryops.events.dlq.
+
+--------------------------------------------------------------------------------
+SLIDE 6 - Three quality gates                                       (~45 sec)
+--------------------------------------------------------------------------------
+"Data quality is layered, and each gate checks a different grain.
+
+Gate 1, Pydantic, checks each record at ingestion: types, ranges, enums, the
+ORD- pattern for order IDs, and business rules, for example that a courier
+must exist once an order has been assigned. A failure here is soft: the record
+goes to the DLQ and the pipeline keeps running.
+
+Gate 2, Pandera, checks the whole Silver DataFrame: event_id unique and not
+null, coordinates and traffic index in range, derived columns correctly typed.
+
+Gate 3, dbt tests, checks the SQL models: not-null and unique keys on staging
+and marts.
+
+Gates 2 and 3 are hard stops. By that point the data should already be clean,
+so a failure means a bug, and we would rather stop than publish wrong KPIs."
+
+--------------------------------------------------------------------------------
+SLIDE 7 - Why this tool, not the alternative                        (~60 sec)
+--------------------------------------------------------------------------------
+"The common thread is production-grade interfaces with laptop-grade footprints.
+
+Redpanda instead of Kafka: same Kafka API, but a single C++ binary with no JVM
+or ZooKeeper. It runs inside a 384 MB cap.
+
+Polars instead of Pandas or PySpark: a multi-threaded columnar engine written
+in Rust. Our data fits on one machine, so a Spark cluster would be pure overhead.
+
+DuckDB instead of Spark SQL: in-process analytical SQL directly on Parquet,
+capped at 1 GB and 2 threads.
+
+dbt-style models instead of ad-hoc SQL: ref() and source() give lineage, and
+tests live next to the models.
+
+Pydantic and Pandera instead of hand-written checks: the schema is the
+documentation, and the error messages feed the DLQ directly.
+
+PostgreSQL for serving, MinIO for S3-compatible storage, OpenTelemetry with
+Jaeger for tracing, and an asset-based DAG instead of Airflow, because we did
+not want scheduler and webserver daemons eating our memory budget."
+
+--------------------------------------------------------------------------------
+SLIDE 8 - Infrastructure and observability                          (~45 sec)
+--------------------------------------------------------------------------------
+"On the left: seven Docker containers, each with an explicit memory limit.
+Together they are capped at 1,792 MB, well inside the 3 GB budget. Only stateful
+services run in Docker. The Python pipeline, API and UI run natively in a
+virtual environment, which keeps them fast and easy to debug.
+
+On the right: the trace of one DAG run, with real durations. Each asset is a
+span. Gold and warehouse dominate because they start DuckDB and scan Parquet.
+
+Every log line from structlog carries the same trace_id and span_id, so from a
+log message we can jump to the exact span in Jaeger."
+
+--------------------------------------------------------------------------------
+SLIDE 9 - Results and next steps                                    (~30 sec)
+--------------------------------------------------------------------------------
+"To summarise: 23 automated tests passing, zero lint issues, a five-asset DAG
+with three quality gates, and seven containers inside 1.8 GB.
+
+Next steps: a native Kafka consumer reading directly from Redpanda, incremental
+Gold builds so we stop re-scanning history, Dagster schedules and sensors, and
+alerting when the DLQ rate crosses a threshold.
+
+Thank you. We are happy to take questions."
+
+
+================================================================================
+ PART B - TECHNICAL APPENDIX: TOOL BY TOOL
+================================================================================
+
+Format for each tool:
+  WHERE  - files in the repository
+  HOW    - what it actually does to the data
+  WHY    - why it, and not the obvious alternative
+
+--------------------------------------------------------------------------------
+B1. Synthetic event generator (Python, random.Random)
+--------------------------------------------------------------------------------
+WHERE  src/deliveryops/ingestion/generator.py  (DeliveryEventGenerator)
+HOW    - Seeded RNG (default seed=42), so every run is reproducible and tests
+         are deterministic.
+       - Four Bangalore zones with real coordinates: BLR-KOR-01 (Koramangala),
+         BLR-HSR-02 (HSR Layout), BLR-IND-03 (Indiranagar), BLR-WHT-04
+         (Whitefield). Lat/long are jittered by +/-0.01 degrees.
+       - Random event type out of 7; courier_id and vehicle_type are only set
+         when the event type needs a courier.
+       - ETA uniform in 15-55 min; actual duration = ETA + uniform(-5, +20) min,
+         only for DELIVERY_COMPLETED. Order value INR 150-2500. Traffic 1.0-9.5.
+       - generate_batch(batch_size, corrupt_ratio) makes round(n * ratio)
+         corrupt payloads using one of four fault modes:
+           bad_order_id              -> order_id = "INVALID_ORDER_FORMAT"
+           missing_courier_on_pickup -> PICKUP_COMPLETED with courier_id = None
+           invalid_lat               -> latitude = 145.0
+           negative_value            -> order_value_inr = -50.0
+         The batch is then shuffled.
+WHY    Real delivery data is not available, and a fixed seed gives repeatable
+       demos and assertions. Fault injection proves the DLQ path works.
+
+--------------------------------------------------------------------------------
+B2. Event broker: Kafka/Redpanda semantics
+--------------------------------------------------------------------------------
+WHERE  src/deliveryops/ingestion/broker.py   (InMemoryEventBroker,
+                                              StreamIngestionConsumer)
+       infra/redpanda/topics.json, docker-compose.yml (service redpanda,
+       redpanda-console), scripts/sync_live_containers.py (sync_redpanda_topics)
+HOW    - Topics: deliveryops.events.raw and deliveryops.events.dlq.
+       - publish() appends a BrokerMessage {topic, partition 0, offset, key,
+         value, published_at}. The offset is monotonic (= position in the log).
+       - The message key is order_id, so in a partitioned Kafka topic all events
+         of one order would land in the same partition and keep their order.
+       - consume() reads from the committed offset of a consumer group
+         ("deliveryops-cg"), up to max_messages, and auto-commits.
+         get_consumer_lag() = total messages - committed offset.
+       - StreamIngestionConsumer.consume_and_sink(): poll the raw topic,
+         validate each message (B3), publish rejects to the DLQ topic, write
+         valid events to Bronze and rejects to the bronze/dlq partition.
+       - Live Redpanda container: after each run, sync_redpanda_topics() runs
+         "rpk topic create" for both topics, then "rpk topic produce" with the
+         latest Bronze and DLQ lines, so they are visible in Redpanda Console
+         at :8081.
+WHY    Redpanda vs Apache Kafka: Redpanda implements the Kafka wire protocol,
+       so any Kafka client works unchanged, but it is a single C++ binary with
+       no JVM and no ZooKeeper/KRaft quorum. In docker-compose it runs with
+       --smp=1 --memory=256M inside a 384 MB container limit. A Kafka + ZooKeeper
+       pair typically needs over 1 GB before it does any work.
+       Why an in-process broker in the pipeline: it makes the pipeline and the
+       23 tests run with zero containers, so they are fast and deterministic,
+       while keeping the exact semantics (offsets, consumer groups, lag) we
+       would use against Redpanda.
+
+--------------------------------------------------------------------------------
+B3. Contract gate: Pydantic v2
+--------------------------------------------------------------------------------
+WHERE  src/deliveryops/contracts/events.py  (DeliveryEvent, GeoLocation,
+       DeadLetterRecord, validate_event_payload, validate_event_batch)
+HOW    - model_config: extra="forbid" (unknown fields are rejected) and
+         frozen=True (events are immutable after validation).
+       - Field rules (examples):
+           order_id               regex ^ORD-[A-Z0-9-]+$
+           latitude / longitude   -90..90 / -180..180
+           estimated_eta_minutes  0..240
+           actual_duration        0..480
+           sla_target_minutes     >0..180, default 35
+           order_value_inr        >0..100000
+           traffic_index          1..10
+           event_type, vehicle_type, weather_condition: enums
+           schema_version         Literal["1.0"]
+       - field_validator: event_timestamp must be timezone-aware and is
+         normalised to UTC.
+       - model_validator (cross-field business rules):
+           courier_id is required for COURIER_ASSIGNED, PICKUP_COMPLETED,
+           IN_TRANSIT_UPDATE and DELIVERY_COMPLETED;
+           actual_duration_minutes is required for DELIVERY_COMPLETED.
+       - On ValidationError the raw payload is wrapped in a DeadLetterRecord:
+         dlq_id ("dlq-" + 12 hex), failed_at (UTC), raw_payload, error_summary
+         ("field: message; ..."), error_details (loc/msg/type per error),
+         source_stage.
+       - Detail worth knowing: field-level validation runs before the
+         model_validator. In the corrupt demo order the price fails first, so
+         the DLQ reason shows "order_value_inr: Input should be greater than 0"
+         and the missing-courier rule is never reached.
+WHY    Pydantic v2 has a Rust core (pydantic-core), so validation is fast
+       enough to run per message. The schema is code, so it is versioned with
+       the pipeline, and the structured errors become the DLQ reason with no
+       extra work. Hand-written if-checks would duplicate this logic and give
+       inconsistent error messages.
+
+--------------------------------------------------------------------------------
+B4. Medallion lake storage (local filesystem, Hive partitions)
+--------------------------------------------------------------------------------
+WHERE  src/deliveryops/storage/local_lake.py  (LocalLakeStorage)
+HOW    Layout under data/lake/:
+         bronze/events/dt=YYYY-MM-DD/events_<batch>.jsonl   (validated events)
+         bronze/dlq/dt=YYYY-MM-DD/dlq_<batch>.jsonl         (rejected records)
+         silver/events/dt=YYYY-MM-DD/silver_<batch>.parquet
+         gold/zone_kpi_daily/dt=.../zone_kpi_<batch>.parquet
+         gold/courier_performance/dt=.../courier_perf_<batch>.parquet
+         warehouse/deliveryops_serving.duckdb
+         traces/otel_<batch>.json
+       Bronze is JSONL (one model_dump_json() per line, append-only). Silver
+       and Gold are Parquet written by Polars.
+WHY    - JSONL for Bronze keeps the record exactly as validated. It is
+         human-readable and easy to replay.
+       - Parquet for Silver and Gold is columnar and compressed, and it keeps
+         the schema. DuckDB and Polars can read only the columns they need.
+       - dt= Hive partitioning is the convention that Spark, Trino, Athena and
+         DuckDB all understand, so the layout ports directly to S3.
+
+--------------------------------------------------------------------------------
+B5. Silver transformation: Polars
+--------------------------------------------------------------------------------
+WHERE  src/deliveryops/processing/silver.py  (BronzeToSilverProcessor)
+HOW    1. Read all Bronze JSONL records across partitions.
+       2. Flatten the nested location object into zone_id, latitude and
+          longitude; derive partition_date from the first 10 characters of
+          event_timestamp.
+       3. Build a DataFrame with an explicit schema (18 typed columns), so
+          types never depend on inference.
+       4. Deduplicate: sort by event_timestamp, then
+          unique(subset=["event_id"], keep="last"). The latest version of an
+          event wins.
+       5. Enrich:
+            effective_duration   = coalesce(actual_duration_minutes,
+                                            estimated_eta_minutes)
+            sla_variance_minutes = round(effective_duration - sla_target, 2)
+            is_sla_breached      = event_type == "SLA_BREACH_DETECTED"
+                                   OR effective_duration > sla_target
+       6. Validate with Pandera (B6).
+       7. partition_by("partition_date") and write one Parquet file per date.
+WHY    Polars is written in Rust on Apache Arrow memory. It is columnar and
+       multi-threaded and has a lazy query optimiser. For laptop-scale data it
+       is typically several times faster than Pandas with lower memory use.
+       PySpark would need a JVM and a Spark session for data that fits in RAM.
+       Arrow memory also means zero-copy hand-off to DuckDB (pl.from_arrow /
+       to_arrow_table).
+
+--------------------------------------------------------------------------------
+B6. DataFrame contract: Pandera
+--------------------------------------------------------------------------------
+WHERE  src/deliveryops/contracts/tabular.py  (SILVER_EVENTS_SCHEMA)
+HOW    pandera.polars DataFrameSchema over the Silver frame:
+         event_id      String, not null, unique
+         order_id      String, starts with "ORD-"
+         latitude      in_range(-90, 90)      longitude in_range(-180, 180)
+         eta           in_range(0, 240)       actual    in_range(0, 480), nullable
+         sla_target    > 0                    order_value > 0
+         traffic_index in_range(1, 10)
+         sla_variance_minutes Float64 not null; is_sla_breached Boolean not null
+       strict=False allows extra columns. Any violation raises, so no Silver
+       Parquet is written.
+WHY    Pydantic checks one record at a time. Pandera checks properties that
+       only exist at table level, such as uniqueness across rows, and checks
+       the derived columns that Polars just added. It works natively on Polars,
+       so there is no conversion to Pandas.
+
+--------------------------------------------------------------------------------
+B7. Gold layer: dbt SQL models executed on DuckDB
+--------------------------------------------------------------------------------
+WHERE  dbt/dbt_project.yml, dbt/models/schema.yml
+       dbt/models/staging/stg_silver_events.sql
+       dbt/models/marts/mart_zone_kpi_daily.sql
+       dbt/models/marts/mart_courier_performance.sql
+       src/deliveryops/processing/dbt_runner.py  (DbtDuckDBRunner)
+HOW    1. Compile: the runner reads the dbt .sql files and resolves the Jinja
+          tags with regular expressions:
+            {{ source('silver','events') }} -> silver_events
+            {{ ref('stg_silver_events') }}  -> stg_silver_events
+       2. Open DuckDB in memory with SET memory_limit='1GB' and SET threads=2.
+       3. conn.read_parquet(<all Silver files>).create_view("silver_events").
+       4. Staging view (stg_silver_events):
+            COALESCE(vehicle_type, 'UNKNOWN'), and cross-batch dedupe with
+            QUALIFY ROW_NUMBER() OVER (PARTITION BY event_id
+                                       ORDER BY event_timestamp DESC) = 1
+       5. Mart mart_zone_kpi_daily (GROUP BY zone_id, partition_date):
+            total_events, distinct_orders, completed_deliveries,
+            failed_deliveries, sla_breach_count,
+            sla_breach_rate_pct = 100 * breaches / events,
+            avg_order_value_inr, avg_eta_minutes, avg_traffic_index
+       6. Mart mart_courier_performance (WHERE courier_id IS NOT NULL,
+          GROUP BY courier_id, vehicle_type, partition_date):
+            total_events, completed_deliveries, sla_breach_count, avg_eta_minutes
+       7. Schema tests, run as SQL:
+            not_null_stg_silver_events_event_id
+            unique_stg_silver_events_event_id
+            not_null_mart_zone_kpi_daily_zone_id
+          Any failure raises ValueError, and Gold is not written.
+       8. Results go to Arrow, then Polars, then Gold Parquet, partitioned by date.
+WHY    dbt: models are plain SELECT statements under version control, ref()
+       and source() give an explicit lineage graph, and tests sit next to the
+       models. This is the industry-standard way to manage SQL transformations.
+       Why execute in-process instead of calling the dbt CLI: dbt-core is
+       installed in .venv and the project follows dbt conventions, but
+       launching the dbt CLI per click adds seconds of start-up and needs a
+       profiles.yml connection. Compiling the same model files inside Python
+       keeps a checkout click under a second and keeps the files dbt-compatible.
+       DuckDB vs Spark SQL: DuckDB is a vectorised, columnar OLAP engine that
+       runs inside the Python process and queries Parquet files directly, with
+       no server and no JVM. The memory and thread caps keep it inside our
+       laptop budget.
+
+--------------------------------------------------------------------------------
+B8. Serving warehouse: DuckDB file, then PostgreSQL 16
+--------------------------------------------------------------------------------
+WHERE  src/deliveryops/storage/warehouse.py  (GoldWarehouseLoader)
+       infra/postgres/001_init_warehouse.sql
+       scripts/sync_live_containers.py  (sync_postgres_warehouse)
+HOW    - GoldWarehouseLoader.sync_from_lake() opens
+         data/lake/warehouse/deliveryops_serving.duckdb and runs
+         CREATE OR REPLACE TABLE for:
+           wh_zone_kpi_daily       <- all Gold zone Parquet files
+           wh_courier_performance  <- all Gold courier Parquet files
+           wh_dlq_audit            <- dlq_id, failed_at, error_summary,
+                                      source_stage from bronze/dlq JSONL
+       - query_summary() serves FastAPI /warehouse/summary (row counts and zones
+         ordered by total_events).
+       - PostgreSQL mirror: the sync script applies the DDL with
+         "docker exec ... psql", reads the three DuckDB tables, then runs
+         TRUNCATE + INSERT into the same tables in Postgres (container
+         deliveryops-postgres, host port 5433, viewable in Adminer at :8082).
+WHY    DuckDB is ideal for building tables from Parquet. PostgreSQL is the
+       serving database: it handles many concurrent client reads, uses
+       standard SQL, and any BI tool can connect to it. Keeping DuckDB as the
+       build engine and Postgres as the serving copy separates analytical
+       compute from the serving workload.
+
+--------------------------------------------------------------------------------
+B9. Object storage: MinIO (S3 API) and LocalStack (AWS emulator)
+--------------------------------------------------------------------------------
+WHERE  src/deliveryops/storage/s3_lake.py  (S3LakeAdapter)
+       infra/minio/buckets.json, scripts/sync_live_containers.py
+HOW    - S3LakeAdapter maps layers to buckets (deliveryops-bronze, -silver,
+         -gold) and converts a local partition path into its canonical URI,
+         e.g. s3://deliveryops-silver/events/dt=2026-11-22/silver_<batch>.parquet
+       - sync_minio_buckets() uses the official minio Python SDK: it creates
+         the three buckets if missing and fput_object()s every file of each
+         layer, keeping the dt= partition path as the object key.
+         Console: http://127.0.0.1:9001  (minioadmin / minioadmin_local_dev)
+       - sync_localstack_aws() talks to LocalStack's S3 endpoint on :4566,
+         creates bucket deliveryops-cloud-archive, uploads the Gold Parquet
+         files, and creates the SQS queue deliveryops-orders-sqs through the
+         SQS CreateQueue API.
+WHY    MinIO implements the S3 API, so the same code and the same s3:// paths
+       work against AWS S3 later with only an endpoint change, at zero cloud
+       cost. LocalStack emulates the AWS service APIs, which lets us show the
+       "cloud archive" and queue integration without an AWS account.
+
+--------------------------------------------------------------------------------
+B10. Orchestration: Dagster-style software-defined asset DAG
+--------------------------------------------------------------------------------
+WHERE  src/deliveryops/pipelines/orchestrator.py  (AssetGraphOrchestrator,
+       PLATFORM_ASSETS), scripts/run_platform.py, FastAPI
+       /orchestration/assets and /orchestration/materialize
+HOW    Five assets, each declaring its upstream keys and compute kind:
+         1 stream_raw_topic          (redpanda_broker)   upstream: none
+         2 bronze_events_and_dlq     (pydantic_v2)       upstream: 1
+         3 silver_validated_events   (polars_pandera)    upstream: 2
+         4 gold_dbt_marts            (dbt_duckdb)        upstream: 3
+         5 warehouse_serving_tables  (duckdb_postgres)   upstream: 4, 2
+       materialize_all() runs them in topological order. Each asset runs inside
+       its own OpenTelemetry span, and the run returns an AssetMaterialization
+       record (row_count, duration_ms, metadata). A pipeline_run_id and
+       batch_id are bound into every log line.
+       Real run: 50 -> 45 (+5 DLQ) -> 45 -> 42 (4 + 38) -> 47 rows, SUCCESS.
+WHY    The asset model describes what data exists and how it depends on other
+       data, not just which tasks run. That gives lineage for free and is the
+       model Dagster uses, so migrating later is direct. Compared with Airflow,
+       there is no scheduler, webserver or metadata database to run, which
+       matters in a 3 GB budget.
+
+--------------------------------------------------------------------------------
+B11. Observability: OpenTelemetry, structlog and Jaeger
+--------------------------------------------------------------------------------
+WHERE  src/deliveryops/observability/tracing.py, logging.py, health.py
+       scripts/sync_live_containers.py (sync_jaeger_traces)
+HOW    - configure_tracing() sets up an OTel TracerProvider with resource
+         service.name=deliveryops-intelligence and an InMemorySpanExporter.
+       - traced_span(name, **attrs) opens a span, sets attributes (order_id,
+         zone_id, batch_id, ...), and binds trace_id and span_id into structlog
+         contextvars. Every log line written inside the span carries them.
+         Example from the real run:
+           stream_batch_sunk consumed=50 valid=45 dlq=5
+           trace_id=4f2e65872518f9ab156edc48c0baa204 span_id=a6a9f9aedc1c8474
+       - export_spans_to_file() writes data/lake/traces/otel_<batch>.json.
+       - sync_jaeger_traces() converts the latest bundle into OTLP/HTTP JSON
+         (resourceSpans -> scopeSpans -> spans) and POSTs it to Jaeger's
+         collector at http://127.0.0.1:4318/v1/traces. View it at :16686.
+       - health.py / FastAPI /infra/status probe the container ports over TCP
+         and report which services are live and which are using local fallbacks.
+WHY    OpenTelemetry is the vendor-neutral standard: the same spans can go to
+       Jaeger, Grafana Tempo, Datadog and others without code changes. Trace-
+       correlated logs mean one ID links a slow span to its log lines. Jaeger
+       all-in-one is a single container capped at 256 MB.
+
+--------------------------------------------------------------------------------
+B12. Serving and UI: FastAPI and Streamlit
+--------------------------------------------------------------------------------
+WHERE  src/deliveryops/api/app.py, src/deliveryops/dashboard/app.py, start.bat
+HOW    FastAPI (uvicorn, :8001, Swagger at /docs):
+         GET  /health, /infra/status, /observability/traces
+         GET  /orchestration/assets      POST /orchestration/materialize
+         GET  /warehouse/summary
+         GET  /analytics/zones, /analytics/couriers, /analytics/dlq
+       Streamlit (:8501): the e-commerce storefront. The "Place Order" and
+       "Simulate Corrupt Order" buttons call submit_live_ecommerce_order(),
+       then _trigger_container_sync(), which calls sync_all_containers(), and
+       show a receipt (order id, valid/DLQ counts, S3 URI, dbt tests, warehouse
+       counts, trace id). Header buttons open the tool UIs in new tabs.
+WHY    FastAPI: async, type-hinted endpoints with automatic OpenAPI docs, and
+       it reuses our Pydantic models. Streamlit: a full interactive UI in pure
+       Python, so there is no separate frontend codebase to maintain.
+
+--------------------------------------------------------------------------------
+B13. Infrastructure: Docker Compose with memory caps
+--------------------------------------------------------------------------------
+WHERE  docker-compose.yml, start.bat, stop.bat, .env.example
+HOW    Service          Image                          Ports        mem_limit
+       postgres         postgres:16-alpine             5433->5432   256m
+       pg-ui (Adminer)  adminer:latest                 8082         96m
+       redpanda         redpanda:v23.3.4               19092, 19644 384m
+       redpanda-console console:v2.4.3                 8081         160m
+       minio            pgsty/minio:latest             9000, 9001   256m
+       jaeger           jaegertracing/all-in-one:1.62  16686,4317/8 256m
+       localstack       localstack/localstack:3.0      4566         384m
+       Total memory cap: 1,792 MB. Profiles (core, streaming, storage,
+       observability, cloud, all) start only what is needed. Data lives in
+       named volumes inside the WSL2 filesystem, not on Windows bind mounts.
+       Postgres is also tuned down: shared_buffers=64MB, work_mem=4MB,
+       max_connections=50.
+       start.bat: docker compose --profile all up -d, run the DAG, sync the
+       containers, then start FastAPI and Streamlit and open all UIs.
+WHY    Explicit limits prevent the WSL2 VM being OOM-killed (exit 137). Named
+       volumes avoid slow Windows-to-Linux file I/O.
+
+--------------------------------------------------------------------------------
+B14. Quality tooling: pytest and Ruff
+--------------------------------------------------------------------------------
+WHERE  tests/unit, tests/integration, pyproject.toml
+HOW    23 tests cover contracts, the broker and dbt runner, the Silver
+       processor, infrastructure and the S3 mapper, tracing, config, the
+       ingestion-to-lake path, the full medallion pipeline, the orchestrator
+       and warehouse, and the API and dashboard. Ruff runs rule sets E, F, I,
+       B and UP at line length 100.
+WHY    Ruff is a Rust linter that replaces flake8, isort and pyupgrade in one
+       fast tool. Because the pipeline runs without containers, the full suite
+       runs in about 3 seconds.
+
+
+================================================================================
+ PART C - WHAT HAPPENS WHEN YOU CLICK
+================================================================================
+
+C1. "Place Order"  (pipelines/live_order.py: submit_live_ecommerce_order)
+--------------------------------------------------------------------------------
+ 1. IDs are generated: order_id = ORD-LIVE-<6 hex>, batch_id = live-<hex>,
+    courier_id = CR-<3 hex>. Coordinates come from the chosen zone.
+ 2. Four payloads are built, one per lifecycle stage, with timestamp offsets:
+      ORDER_CREATED       t+0 min   (no courier)
+      COURIER_ASSIGNED    t+2 min   courier + vehicle
+      PICKUP_COMPLETED    t+8 min
+      DELIVERY_COMPLETED  t+<duration> min, actual_duration_minutes set
+    ETA = 28 min, SLA target = 35 min, traffic = 6.5 if not CLEAR else 3.2.
+ 3. A root span "ecommerce.checkout_order" opens (attributes: order_id,
+    product, zone_id, simulate_corrupt).
+ 4. validate_event_batch(): all 4 pass Pydantic.
+ 5. Bronze: bronze/events/dt=<today>/events_live-<hex>.jsonl (4 lines).
+ 6. Silver: Polars reprocesses all Bronze, recomputes SLA columns and validates
+    with Pandera. With 42 min > 35 min, this order's DELIVERY_COMPLETED row has
+    is_sla_breached = true and sla_variance_minutes = 7.0.
+ 7. Gold: the dbt models are rebuilt in DuckDB and the 3 tests pass.
+ 8. Warehouse: the DuckDB serving tables are refreshed.
+ 9. The trace is written to traces/otel_live-<hex>.json, and the Silver path
+    is converted to its s3:// URI for the receipt.
+10. Container sync: Postgres (DDL + TRUNCATE/INSERT), Redpanda (rpk produce of
+    the latest raw and DLQ lines), MinIO (bucket upload), Jaeger (OTLP POST),
+    LocalStack (Gold archive + SQS queue).
+ Real run receipt: valid_events_count=4, dlq_count=0, sla_breached=true,
+ 3/3 dbt tests passed.
+
+ Where to look:
+   Adminer :8082     -> wh_zone_kpi_daily, wh_courier_performance
+   Redpanda :8081    -> topic deliveryops.events.raw (new messages)
+   MinIO :9001       -> deliveryops-bronze / -silver / -gold, dt= folders
+   Jaeger :16686     -> service deliveryops-intelligence, span
+                        ecommerce.checkout_order
+   LocalStack :4566  -> /deliveryops-cloud-archive
+
+C2. "Simulate Corrupt Order"
+--------------------------------------------------------------------------------
+ 1. One payload: event_type PICKUP_COMPLETED, courier_id = None,
+    order_value_inr = -500.0, actual_duration_minutes = None.
+ 2. Pydantic rejects it. Real error_summary:
+      "order_value_inr: Input should be greater than 0"
+    (The field error stops validation before the cross-field courier rule runs.)
+ 3. Nothing is written to Bronze events. A DeadLetterRecord is written to
+    bronze/dlq/dt=<today>/dlq_live-<hex>.jsonl with the full raw payload,
+    error details and source_stage = "ecommerce_storefront".
+ 4. Silver, Gold and the warehouse still run over the existing good data, so
+    KPIs are unchanged and wh_dlq_audit gains 1 row (5 -> 6 in our run).
+ 5. The sync publishes the DLQ line to topic deliveryops.events.dlq and copies
+    wh_dlq_audit to Postgres.
+ Real run receipt: valid_events_count=0, dlq_count=1.
+
+ Where to look:
+   Adminer -> wh_dlq_audit (newest row: error_summary + source_stage)
+   Redpanda Console -> deliveryops.events.dlq
+   Jaeger -> span with simulate_corrupt=true
+
+
+================================================================================
+ PART D - FACULTY Q&A PREPARATION
+================================================================================
+
+Q: Is this real streaming?
+A: The pipeline uses an in-process broker with Kafka semantics (topics,
+   offsets, consumer groups, lag), so it runs and tests without containers.
+   The real Redpanda container receives the same records through rpk after
+   each run, and you can browse them in Redpanda Console. Replacing the
+   in-process broker with a Kafka client consumer is the first next step.
+
+Q: Why have both Pydantic and Pandera?
+A: They check different things. Pydantic validates one record at the moment it
+   arrives and decides DLQ vs Bronze. Pandera validates the whole Silver table,
+   including uniqueness across rows and the columns we derived in Polars.
+
+Q: Is that really dbt?
+A: The models, dbt_project.yml and schema.yml follow dbt conventions, and
+   dbt-core is installed. At runtime we compile the same model files in Python
+   (resolving source() and ref()) and run them on DuckDB, which avoids dbt CLI
+   start-up time on every checkout click. The same files can be run with dbt
+   and a dbt-duckdb profile.
+
+Q: How do you guarantee idempotency or deduplication?
+A: Silver dedupes on event_id (latest timestamp wins), and the dbt staging
+   model dedupes again across batches with QUALIFY ROW_NUMBER(). Bronze events
+   are keyed by event_id.
+
+Q: What happens if Docker is not running?
+A: The pipeline, API and UI still work on the local lake. Every container sync
+   is wrapped in try/except and reports "skipped", and /infra/status shows
+   which services are using fallbacks.
+
+Q: How would this move to the cloud?
+A: Change endpoints, not logic: Redpanda to MSK or Confluent, MinIO to S3
+   (same s3:// paths), Postgres to RDS, the OTLP collector to any OTel backend,
+   and the asset DAG to Dagster.
+
+Known limitations (be upfront if asked)
+--------------------------------------------------------------------------------
+ 1. In-process broker: see the first answer above.
+ 2. Gold re-scan: each run rebuilds Gold from all Silver and writes a new Gold
+    file per batch, and the warehouse reads every Gold file. Repeated clicks
+    therefore add repeated KPI snapshots. In our run, wh_zone_kpi_daily went
+    4 -> 9 -> 14. The fix is to overwrite Gold per partition or dedupe on
+    (zone_id, partition_date); this is the "incremental Gold" next step.
+ 3. Silver re-reads all of Bronze on every run. That is fine at demo scale;
+    in production it would be incremental, driven by consumer offsets.
+ 4. The Postgres load builds INSERT statements and pipes them through psql.
+    That is acceptable for a demo; production would use COPY or a driver with
+    parameterised queries.
+ 5. Jaeger timestamps are re-based to the push time when spans are replayed
+    from the JSON bundle; durations are preserved.
+
+Credentials (local development only)
+--------------------------------------------------------------------------------
+ PostgreSQL : host 127.0.0.1, port 5433, db deliveryops,
+              user deliveryops, password deliveryops_local_dev
+              (Adminer: http://127.0.0.1:8082, server "postgres")
+ MinIO      : http://127.0.0.1:9001, minioadmin / minioadmin_local_dev
+ Jaeger     : http://127.0.0.1:16686 (no login)
+ Redpanda   : http://127.0.0.1:8081 (no login)
+ LocalStack : http://127.0.0.1:4566 (keys "test" / "test")
+
+================================================================================
+ END
+================================================================================

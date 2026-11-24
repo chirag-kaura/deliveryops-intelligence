@@ -26,12 +26,27 @@ services:
     cpus: 0.50
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-deliveryops} -d ${POSTGRES_DB:-deliveryops}"]
-      interval: 10s
+      interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
+
+  pg-ui:
+    image: adminer:latest
+    container_name: deliveryops-pg-ui
+    profiles: ["core", "all"]
+    restart: unless-stopped
+    depends_on:
+      - postgres
+    environment:
+      ADMINER_DEFAULT_SERVER: postgres
+      ADMINER_DESIGN: pepa-linha-dark
+    ports:
+      - "8082:8080"
+    mem_limit: 96m
+    cpus: 0.25
 
   redpanda:
-    image: docker.redpanda.com/redpandadata/redpanda:v24.2.8
+    image: docker.redpanda.com/redpandadata/redpanda:v23.3.4
     container_name: deliveryops-redpanda
     profiles: ["streaming", "all"]
     restart: unless-stopped
@@ -40,7 +55,7 @@ services:
       - start
       - --mode=dev-container
       - --smp=1
-      - --memory=512M
+      - --memory=256M
       - --reserve-memory=0M
       - --overprovisioned
       - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
@@ -50,16 +65,25 @@ services:
       - "19644:9644"
     volumes:
       - redpandadata:/var/lib/redpanda/data
-    mem_limit: 640m
+    mem_limit: 384m
     cpus: 1.00
-    healthcheck:
-      test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true' || exit 1"]
-      interval: 15s
-      timeout: 10s
-      retries: 5
+
+  redpanda-console:
+    image: docker.redpanda.com/redpandadata/console:v2.4.3
+    container_name: deliveryops-redpanda-console
+    profiles: ["streaming", "all"]
+    restart: unless-stopped
+    depends_on:
+      - redpanda
+    environment:
+      KAFKA_BROKERS: redpanda:9092
+    ports:
+      - "8081:8080"
+    mem_limit: 160m
+    cpus: 0.25
 
   minio:
-    image: minio/minio:latest
+    image: pgsty/minio:latest
     container_name: deliveryops-minio
     profiles: ["storage", "all"]
     restart: unless-stopped
@@ -74,11 +98,6 @@ services:
       - miniodata:/data
     mem_limit: 256m
     cpus: 0.50
-    healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
 
   jaeger:
     image: jaegertracing/all-in-one:1.62.0
@@ -94,13 +113,24 @@ services:
       - "4318:4318"
     mem_limit: 256m
     cpus: 0.50
-    healthcheck:
-      test: ["CMD-SHELL", "wget --spider -q http://localhost:14269/ || exit 1"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
+
+  localstack:
+    image: localstack/localstack:3.0
+    container_name: deliveryops-localstack
+    profiles: ["cloud", "all"]
+    restart: unless-stopped
+    environment:
+      SERVICES: s3,sqs
+      DEBUG: "0"
+    ports:
+      - "4566:4566"
+    volumes:
+      - localstackdata:/var/lib/localstack
+    mem_limit: 384m
+    cpus: 0.50
 
 volumes:
   pgdata:
   redpandadata:
   miniodata:
+  localstackdata:

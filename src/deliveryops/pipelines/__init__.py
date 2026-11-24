@@ -1,5 +1,6 @@
 """Pipeline execution and orchestration wrappers."""
 
+from deliveryops.pipelines.live_order import submit_live_ecommerce_order
 from deliveryops.pipelines.orchestrator import (
     PLATFORM_ASSETS,
     AssetGraphOrchestrator,
@@ -17,4 +18,5 @@ __all__ = [
     "MedallionPipelineRunner",
     "OrchestrationRunResult",
     "PipelineRunMetrics",
+    "submit_live_ecommerce_order",
 ]

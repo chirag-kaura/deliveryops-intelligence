@@ -1,4 +1,4 @@
--- dbt staging model: normalizes Silver delivery events
+-- dbt staging model: normalizes and deduplicates Silver delivery events across batches
 SELECT
     event_id,
     event_type,
@@ -21,3 +21,4 @@ SELECT
     weather_condition,
     traffic_index
 FROM {{ source('silver', 'events') }}
+QUALIFY ROW_NUMBER() OVER (PARTITION BY event_id ORDER BY event_timestamp DESC) = 1
